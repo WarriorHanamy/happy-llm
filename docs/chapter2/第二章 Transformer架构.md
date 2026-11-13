@@ -117,7 +117,7 @@ $$
 attention(Q,K,V) = softmax(\frac{QK^T}{\sqrt{d_k}})V
 $$
 
-这也就是注意力机制的核心计算公式了。
+这也就是注意力机制的核心计算公式了。写成矩阵时，这一步是二维的：`Q` 为 `(seq_q, d_k)`，`K` 为 `(seq_k, d_k)`，`V` 为 `(seq_k, d_v)`。`QK^T` 得到 `(seq_q, seq_k)`，再乘上 `V` 得到 `(seq_q, d_v)`。`d_k` 是 query 和 key 的通道数，`d_v` 是 value 的通道数，两者可以不同。
 
 ### 2.1.3 注意力机制的实现
 
@@ -125,18 +125,23 @@ $$
 
 ```python
 '''注意力计算函数'''
-def attention(query, key, value, dropout=None):
+def attention(
+    query: torch.Tensor,  # (..., seq_q, d_k)
+    key: torch.Tensor,    # (..., seq_k, d_k)
+    value: torch.Tensor,  # (..., seq_k, d_v)
+    dropout=None,         # 可选，对权重 (..., seq_q, seq_k) 做 dropout
+) -> tuple[torch.Tensor, torch.Tensor]:  # (..., seq_q, d_v), (..., seq_q, seq_k)
     '''
-    args:
-    query: 查询值矩阵
-    key: 键值矩阵
-    value: 真值矩阵
+    矩阵乘只使用最后两维。... 是前导维：空着就是二维矩阵；
+    一个前导维是 batch；多头时是 (batch, n_heads)。d_v 不必等于 d_k。
     '''
-    # 获取键向量的维度，键向量的维度和值向量的维度相同
-    d_k = query.size(-1) 
+    # d_k 取 query 的最后一维
+    d_k = query.size(-1)
+    # scores: (..., seq_q, seq_k)
     # 计算Q与K的内积并除以根号dk
     # transpose——相当于转置
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    # p_attn: (..., seq_q, seq_k)
     # Softmax
     p_attn = scores.softmax(dim=-1)
     if dropout is not None:
@@ -147,7 +152,7 @@ def attention(query, key, value, dropout=None):
 
 ```
 
-注意，在上文代码中，我们假设输入的 q、k、v 是已经经过转化的词向量矩阵，也就是公式中的 Q、K、V。我们仅需要通过上述几行代码，就可以实现核心的注意力机制计算。
+上文的公式是二维矩阵。这段代码用 `size(-1)` 和 `transpose(-2, -1)`，所以只规定最后两维，前面的维度会原样留下来：`query` 是 `(..., seq_q, d_k)`，`key` 是 `(..., seq_k, d_k)`，`value` 是 `(..., seq_k, d_v)`。`...` 可以是空的，那就是和公式一致的二维；训练时通常多一个 `batch`，变成三维 `(batch, seq, d)`；多头注意力再多一个头维，变成四维 `(batch, n_heads, seq, head_dim)`。返回的第一个张量是加权结果 `(..., seq_q, d_v)`，第二个是注意力权重 `(..., seq_q, seq_k)`。
 
 ### 2.1.4 自注意力
 
@@ -161,6 +166,7 @@ def attention(query, key, value, dropout=None):
 
 ```python
 # attention 为上文定义的注意力计算函数
+# x: (..., seq, d)，三路共用，因此 seq_q == seq_k，且 d_k == d_v == d
 attention(x, x, x)
 ```
 
@@ -191,13 +197,13 @@ attention(x, x, x)
 
 在每一行输入中，模型仍然是只看到前面的 token，预测下一个 token。但是注意，上述输入不再是串行的过程，而可以一起并行地输入到模型中，模型只需要每一个样本根据未被遮蔽的 token 来预测下一个 token 即可，从而实现了并行的语言模型。
 
-观察上述的掩码，我们可以发现其实则是一个和文本序列等长的上三角矩阵。我们可以简单地通过创建一个和输入同等长度的上三角矩阵作为注意力掩码，再使用掩码来遮蔽掉输入即可。也就是说，当输入维度为 （batch_size, seq_len, hidden_size）时，我们的 Mask 矩阵维度一般为 (1, seq_len, seq_len)（通过广播实现同一个 batch 中不同样本的计算）。
+观察上述的掩码，我们可以发现其实则是一个和文本序列等长的上三角矩阵。我们可以简单地通过创建一个和输入同等长度的上三角矩阵作为注意力掩码，再使用掩码来遮蔽掉输入即可。若此时注意力分数还没有头维、形状是 `(batch, seq, seq)`，Mask 就是 `(1, seq, seq)`，长度为 1 的那一维按 batch 广播。多头分数是四维 `(batch, n_heads, seq, seq)`，Mask 要再多一个长度为 1 的头维，写成 `(1, 1, seq, seq)`，见下一节。
 
 在具体实现中，我们通过以下代码生成 Mask 矩阵：
 
 ```python
 # 创建一个上三角矩阵，用于遮蔽未来信息。
-# 先通过 full 函数创建一个 1 * seq_len * seq_len 的矩阵
+# mask: (1, max_seq_len, max_seq_len)，加到三维分数 (batch, seq, seq) 上
 mask = torch.full((1, args.max_seq_len, args.max_seq_len), float("-inf"))
 # triu 函数的功能是创建一个上三角矩阵
 mask = torch.triu(mask, diagonal=1)
@@ -208,7 +214,7 @@ mask = torch.triu(mask, diagonal=1)
 在注意力计算时，我们会将计算得到的注意力分数与这个掩码做和，再进行 Softmax 操作：
 
 ```python
-# 此处的 scores 为计算得到的注意力分数，mask 为上文生成的掩码矩阵
+# scores: (batch, seq, seq)；mask[:, :seqlen, :seqlen] 为 (1, seq, seq)
 scores = scores + mask[:, :seqlen, :seqlen]
 scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 ```
@@ -238,7 +244,9 @@ $$
 
 其最直观的代码实现并不复杂，即 n 个头就有 n 组3个参数矩阵，每一组进行同样的注意力计算，但由于是不同的参数矩阵从而通过反向传播实现了不同的注意力结果，然后将 n 个结果拼接起来输出即可。
 
-但上述实现时空复杂度均较高，我们可以通过矩阵运算巧妙地实现并行的多头计算，其核心逻辑在于使用三个组合矩阵来代替了n个参数矩阵的组合，也就是矩阵内积再拼接其实等同于拼接矩阵再内积。具体实现可以参考下列代码：
+但上述实现时空复杂度均较高，我们可以通过矩阵运算巧妙地实现并行的多头计算，其核心逻辑在于使用三个组合矩阵来代替了n个参数矩阵的组合，也就是矩阵内积再拼接其实等同于拼接矩阵再内积。
+
+下面这份实现的入口是三维的：`q`、`k`、`v` 都是 `(batch, seq, n_embd)`。`view` 用的是 query 的序列长度，所以 key 和 value 的 `seq` 必须和 query 相同，这里不能写成上一节那种 `seq_q` 与 `seq_k` 可以不同的形式。线性层之后拆成 `(batch, seq, n_heads, head_dim)`，再交换成 `(batch, n_heads, seq, head_dim)`，矩阵乘只发生在每个头的最后两维。分数是 `(batch, n_heads, seq, seq)`，乘上 value 得到 `(batch, n_heads, seq, head_dim)`，合并头再经输出投影得到 `(batch, seq, dim)`。示例配置里 `dim == n_embd`，这个输出才能和残差直接相加。具体实现可以参考下列代码：
 
 ```python
 import torch.nn as nn
@@ -273,15 +281,20 @@ class MultiHeadAttention(nn.Module):
 
         # 创建一个上三角矩阵，用于遮蔽未来信息
         # 注意，因为是多头注意力，Mask 矩阵比之前我们定义的多一个维度
+        # mask: (1, 1, max_seq_len, max_seq_len)，广播到分数 (batch, n_heads, seq, seq)
         if is_causal:
             mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
             mask = torch.triu(mask, diagonal=1)
             # 注册为模型的缓冲区
             self.register_buffer("mask", mask)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-
-        # 获取批次大小和序列长度，[batch_size, seq_len, dim]
+    def forward(
+        self,
+        q: torch.Tensor,  # (batch, seq, n_embd)
+        k: torch.Tensor,  # (batch, seq, n_embd)，seq 必须与 q 相同
+        v: torch.Tensor,  # (batch, seq, n_embd)，seq 必须与 q 相同
+    ) -> torch.Tensor:  # (batch, seq, dim)；残差相加要求 dim == n_embd
+        # q 是三维。下面的 view 用 q 的 seq，所以 k、v 不能更长或更短。
         bsz, seqlen, _ = q.shape
 
         # 计算查询（Q）、键（K）、值（V）,输入通过参数矩阵层，维度为 (B, T, n_embed) x (n_embed, dim) -> (B, T, dim)
@@ -320,7 +333,7 @@ class MultiHeadAttention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         # 最终投影回残差流。
-        output = self.wo(output)
+        output = self.wo(output)  # (batch, seq, dim)
         output = self.resid_dropout(output)
         return output
 ```
@@ -366,15 +379,15 @@ class MLP(nn.Module):
         # 定义dropout层，用于防止过拟合
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        # 前向传播函数
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, dim)。线性层只作用在最后一维
         # 首先，输入x通过第一层线性变换和RELU激活函数
         # 最后，通过第二层线性变换和dropout层
         return self.dropout(self.w2(F.relu(self.w1(x))))
     
 ```
 
-注意，Transformer 的前馈神经网络是由两个线性层中间加一个 RELU 激活函数组成的，以及前馈神经网络还加入了一个 Dropout 层来防止过拟合。Dropout 层只在训练时开启，推理/测试阶段关闭，所以许多Transformer结构示意图中不会画出该层。
+注意，Transformer 的前馈神经网络是由两个线性层中间加一个 RELU 激活函数组成的，以及前馈神经网络还加入了一个 Dropout 层来防止过拟合。Dropout 层只在训练时开启，推理/测试阶段关闭，所以许多Transformer结构示意图中不会画出该层。送进这一层的 `x` 是三维 `(batch, seq, dim)`，两个线性层只改最后一维，输出形状不变。
 
 ### 2.2.3 层归一化
 
@@ -425,14 +438,14 @@ class LayerNorm(nn.Module):
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
 	
-    def forward(self, x):
-        # 在统计每个样本所有维度的值，求均值和方差
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)。均值和方差在最后一维，形状 (batch, seq, 1)
         mean = x.mean(-1, keepdim=True) # mean: [bsz, max_len, 1]
         std = x.std(-1, keepdim=True) # std: [bsz, max_len, 1]
         # 注意这里也在最后一个维度发生了广播
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 ```
-注意，在我们上文实现的 Layer Norm 层中，有两个线性矩阵进行映射。
+注意，在我们上文实现的 Layer Norm 层中，有两个线性矩阵进行映射。调用处的 `x` 是三维 `(batch, seq, n_embd)`：均值和方差沿最后一维计算，得到 `(batch, seq, 1)`，再广播回原来的形状，所以输出仍然是 `(batch, seq, n_embd)`。
 
 ### 2.2.4 残差连接
 
@@ -462,7 +475,7 @@ out = h + self.feed_forward.forward(self.fnn_norm(h))
 ### 2.2.5 Encoder
 
 
-在实现上述组件之后，我们可以搭建起 Transformer 的 Encoder。Encoder 由 N 个 Encoder Layer 组成，每一个 Encoder Layer 包括一个注意力层和一个前馈神经网络。因此，我们可以首先实现一个 Encoder Layer：
+在实现上述组件之后，我们可以搭建起 Transformer 的 Encoder。Encoder 由 N 个 Encoder Layer 组成，每一个 Encoder Layer 包括一个注意力层和一个前馈神经网络。每一层的输入和输出都是三维 `(batch, seq, n_embd)`（示例里 `dim == n_embd`）。因此，我们可以首先实现一个 Encoder Layer：
 
 ```python
 class EncoderLayer(nn.Module):
@@ -476,7 +489,8 @@ class EncoderLayer(nn.Module):
         self.fnn_norm = LayerNorm(args.n_embd)
         self.feed_forward = MLP(args.dim, args.dim, args.dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)，且 dim == n_embd
         # Layer Norm
         norm_x = self.attention_norm(x)
         # 自注意力
@@ -497,7 +511,8 @@ class Encoder(nn.Module):
         self.layers = nn.ModuleList([EncoderLayer(args) for _ in range(args.n_layer)])
         self.norm = LayerNorm(args.n_embd)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)
         "分别通过 N 层 Encoder Layer"
         for layer in self.layers:
             x = layer(x)
@@ -508,7 +523,7 @@ class Encoder(nn.Module):
 
 ### 2.2.6 Decoder
 
-类似的，我们也可以先搭建 Decoder Layer，再将 N 个 Decoder Layer 组装为 Decoder。但是和 Encoder 不同的是，Decoder 由两个注意力层和一个前馈神经网络组成。第一个注意力层是一个掩码自注意力层，即使用 Mask 的注意力计算，保证每一个 token 只能使用该 token 之前的注意力分数；第二个注意力层是一个多头注意力层，该层将使用第一个注意力层的输出作为 query，使用 Encoder 的输出作为 key 和 value，来计算注意力分数。最后，再经过前馈神经网络：
+类似的，我们也可以先搭建 Decoder Layer，再将 N 个 Decoder Layer 组装为 Decoder。但是和 Encoder 不同的是，Decoder 由两个注意力层和一个前馈神经网络组成。第一个注意力层是一个掩码自注意力层，即使用 Mask 的注意力计算，保证每一个 token 只能使用该 token 之前的注意力分数；第二个注意力层是一个多头注意力层，该层将使用第一个注意力层的输出作为 query，使用 Encoder 的输出作为 key 和 value，来计算注意力分数。在这份实现里，query 和 encoder 输出都是 `(batch, seq, n_embd)`，而且两边的 `seq` 相同。最后，再经过前馈神经网络：
 
 ```python
 class DecoderLayer(nn.Module):
@@ -526,7 +541,8 @@ class DecoderLayer(nn.Module):
         # 第三个部分是 MLP
         self.feed_forward = MLP(args.dim, args.dim, args.dropout)
 
-    def forward(self, x, enc_out):
+    def forward(self, x: torch.Tensor, enc_out: torch.Tensor) -> torch.Tensor:
+        # x, enc_out, 返回值: (batch, seq, n_embd)。本实现里两边的 seq 相同
         # Layer Norm
         norm_x = self.attention_norm_1(x)
         # 掩码自注意力
@@ -550,7 +566,8 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layer)])
         self.norm = LayerNorm(args.n_embd)
 
-    def forward(self, x, enc_out):
+    def forward(self, x: torch.Tensor, enc_out: torch.Tensor) -> torch.Tensor:
+        # x, enc_out, 返回值: (batch, seq, n_embd)
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
             x = layer(x, enc_out)
@@ -582,15 +599,15 @@ output: 2
 
 当然，在实际情况下，tokenizer 的工作会比这更复杂。例如，分词有多种不同的方式，可以切分成词、切分成子词、切分成字符等，而词表大小则往往高达数万数十万。此处我们不赘述 tokenizer 的详细情况，在后文会详细介绍大模型的 tokenizer 是如何运行和训练的。
 
-因此，Embedding 层的输入往往是一个形状为 （batch_size，seq_len，1）的矩阵，第一个维度是一次批处理的数量，第二个维度是自然语言序列的长度，第三个维度则是 token 经过 tokenizer 转化成的 index 值。例如，对上述输入，Embedding 层的输入会是：
+因此，送进 `nn.Embedding` 的是 token id，形状为 `(batch, seq)`，不是在最后再套一维。`batch` 是一次批处理的样本数，`seq` 是序列长度，每个元素是 tokenizer 给出的整数下标。例如上面三个 token 组成的一个样本是：
 
 ```
-[[[0],[1],[2]]]
+[[0, 1, 2]]
 ```
 
-其 batch_size 为1，seq_len 为3，转化出来的 index 如上。
+即 `batch` 为 1、`seq` 为 3。下文 `Transformer.forward` 里用 `b, t = idx.size()` 解开的也是这两维。
 
-而 Embedding 内部其实是一个可训练的（Vocab_size，embedding_dim）的权重矩阵，词表里的每一个值，都对应一行维度为 embedding_dim 的向量。对于输入的值，会对应到这个词向量，然后拼接成（batch_size，seq_len，embedding_dim）的矩阵输出。
+Embedding 内部是可训练的权重 `(vocab_size, n_embd)`：词表中每个 id 对应一行长度为 `n_embd` 的向量。查表后在最后一维拼上这行向量，输出 `(batch, seq, n_embd)`。
 
 上述实现并不复杂，我们可以直接使用 torch 中的 Embedding 层：
 
@@ -649,7 +666,8 @@ $$
 ```python
 import numpy as np
 import matplotlib.pyplot as plt
-def PositionEncoding(seq_len, d_model, n=10000):
+def PositionEncoding(seq_len: int, d_model: int, n: int = 10000):
+    # 返回 P: (seq_len, d_model)，二维，没有 batch 维
     P = np.zeros((seq_len, d_model))
     for k in range(seq_len):
         for i in np.arange(int(d_model/2)):
@@ -752,6 +770,8 @@ $$
 </div>
 
 
+上面的手算例子和 `PositionEncoding` 都是二维的 `(seq_len, d_model)`，没有 batch。放进模型时，位置编码存成 `(1, block_size, n_embd)`，加到词嵌入 `(batch, seq, n_embd)` 上，长度为 1 的那一维按 batch 广播。
+
 基于上述原理，我们实现一个​位置编码层：
 
 ```python
@@ -774,11 +794,11 @@ class PositionalEncoding(nn.Module):
         # 分别计算 sin、cos 结果
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
+        pe = pe.unsqueeze(0)  # (block_size, n_embd) -> (1, block_size, n_embd)
         self.register_buffer("pe", pe)
 
-    def forward(self, x):
-        # 将位置编码加到 Embedding 结果上
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)。pe 的 batch 维是 1，按 batch 广播
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
         return x
 ```
@@ -843,10 +863,15 @@ class Transformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     '''前向计算函数'''
-    def forward(self, idx, targets=None):
-        # 输入为 idx，维度为 (batch size, sequence length, 1)；targets 为目标序列，用于计算 loss
+    def forward(
+        self,
+        idx: torch.Tensor,  # (batch, seq) token id
+        targets: Optional[torch.Tensor] = None,  # (batch, seq) token id，推理时为 None
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # 训练: logits (batch, seq, vocab)，loss 为标量
+        # 推理: logits (batch, 1, vocab)，loss 为 None
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size()  # idx 是二维 (batch, seq)，不是 (batch, seq, 1)
         assert t <= self.args.block_size, f"不能计算该序列，该序列长度为 {t}, 最大序列长度只有 {self.args.block_size}"
 
         # 通过 self.transformer
@@ -876,7 +901,7 @@ class Transformer(nn.Module):
         else:
             # 推理阶段，我们只需要 logits，loss 为 None
             # 取 -1 是只取序列中的最后一个作为输出
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])  # (batch, 1, vocab)；list [-1] 保留 seq 维
             loss = None
 
         return logits, loss
@@ -886,7 +911,7 @@ class Transformer(nn.Module):
 
 - get_num_params：用于统计模型的参数量
 - _init_weights：用于对模型所有参数进行随机初始化
-- forward：前向计算函数
+- forward：前向计算函数。`idx` 是二维 `(batch, seq)` 的 token id，词嵌入之后才变成 `(batch, seq, n_embd)`。训练时 `logits` 为 `(batch, seq, vocab)`，推理时只保留最后一个位置，为 `(batch, 1, vocab)`。签名里的 `Optional` 来自 `typing`。
 
 另外，在前向计算函数中，我们对模型使用 pytorch 的交叉熵函数来计算损失，对于不同的损失函数，读者可以查阅 Pytorch 的官方文档，此处就不再赘述了。
 

@@ -51,14 +51,16 @@ class RMSNorm(nn.Module):
         # weight是一个可学习的参数，全部初始化为1
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, dim)。平方均值在最后一维，形状 (batch, seq, 1)
         # 计算RMSNorm的核心部分
         # x.pow(2).mean(-1, keepdim=True)计算了输入x的平方的均值
         # torch.rsqrt是平方根的倒数，这样就得到了RMSNorm的分母部分，再加上eps防止分母为0
         # 最后乘以x，得到RMSNorm的结果
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, dim)
         # forward函数是模型的前向传播
         # 首先将输入x转为float类型，然后进行RMSNorm，最后再转回原来的数据类型
         # 最后乘以weight，这是RMSNorm的一个可学习的缩放因子
@@ -67,7 +69,10 @@ class RMSNorm(nn.Module):
 
 # 获得旋转嵌入的实部和虚部
 # 注意：此处的dim应为 dim//n_head，因为我们是对每个head进行旋转嵌入
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # 返回 freqs_cos, freqs_sin，各为二维 (end, dim // 2)
     # torch.arange(0, dim, 2)[: (dim // 2)].float()生成了一个从0开始，步长为2的序列，长度为dim的一半
     # 然后每个元素除以dim，再取theta的倒数，得到频率
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -82,7 +87,10 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     return freqs_cos, freqs_sin
 
 # 此函数的作用是将freqs_cis调整为与x的形状相同，以便能够与x进行广播操作
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+def reshape_for_broadcast(
+    freqs_cis: torch.Tensor,  # (seq, head_dim // 2)
+    x: torch.Tensor,  # (batch, seq, n_heads, head_dim // 2)
+) -> torch.Tensor:  # (1, seq, 1, head_dim // 2)
     # 获取x的维度数
     ndim = x.ndim
     # 断言，确保1在x的维度范围内
@@ -95,11 +103,11 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(shape)
 
 def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cos: torch.Tensor,
-    freqs_sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq: torch.Tensor,  # (batch, seq, n_heads, head_dim)
+    xk: torch.Tensor,  # (batch, seq, n_kv_heads, head_dim)
+    freqs_cos: torch.Tensor,  # (seq, head_dim // 2)
+    freqs_sin: torch.Tensor,  # (seq, head_dim // 2)
+) -> Tuple[torch.Tensor, torch.Tensor]:  # 与 xq、xk 同形
 
     # 将查询和键张量转换为浮点数，并重塑形状以分离实部和虚部
     xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
@@ -121,8 +129,11 @@ def apply_rotary_emb(
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    # 获取输入张量的形状：批量大小、序列长度、键/值对头的数量、每个头的维度大小
+def repeat_kv(
+    x: torch.Tensor,  # (batch, seq, n_kv_heads, head_dim)
+    n_rep: int,
+) -> torch.Tensor:  # (batch, seq, n_kv_heads * n_rep, head_dim)
+    # 四维，没有更外层的维度。n_rep == 1 时原样返回。
     bs, slen, n_kv_heads, head_dim = x.shape
     
     # 如果重复次数为1，则不需要重复，直接返回原始张量
@@ -179,13 +190,18 @@ class Attention(nn.Module):
             # 注册为模型的缓冲区
             self.register_buffer("mask", mask)
 
-    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        # 获取批次大小和序列长度，[batch_size, seq_len, dim]
+    def forward(
+        self,
+        x: torch.Tensor,  # (batch, seq, dim)
+        freqs_cos: torch.Tensor,  # (seq, head_dim // 2)
+        freqs_sin: torch.Tensor,  # (seq, head_dim // 2)
+        attention_mask: Optional[torch.Tensor] = None,  # (batch, seq)，True 为有效 token
+    ) -> torch.Tensor:  # (batch, seq, dim)
         bsz, seqlen, _ = x.shape
 
-        # 计算查询（Q）、键（K）、值（V）。
+        # 计算查询（Q）、键（K）、值（V）。投影后仍是 (batch, seq, n_heads * head_dim) 或更少的 kv 头。
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        # 调整形状以适应头的维度。
+        # (batch, seq, dim) -> (batch, seq, n_local_heads, head_dim)；kv 的头数是 n_local_kv_heads
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -197,7 +213,7 @@ class Attention(nn.Module):
         xk = repeat_kv(xk, self.n_rep)
         xv = repeat_kv(xv, self.n_rep)
 
-        # 将头作为批次维度处理。
+        # (batch, seq, n_heads, head_dim) -> (batch, n_heads, seq, head_dim)
         xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
@@ -230,6 +246,7 @@ class Attention(nn.Module):
                 )
         else:
             # 使用手动实现的注意力机制。
+            # scores: (batch, n_heads, seq, seq)；mask 为 (1, 1, max_seq, max_seq)
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
             scores = scores + self.mask[:, :, :seqlen, :seqlen]
@@ -237,9 +254,9 @@ class Attention(nn.Module):
                 scores = scores.masked_fill(~key_padding_mask, float("-inf"))
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            output = torch.matmul(scores, xv)
+            output = torch.matmul(scores, xv)  # (batch, n_heads, seq, head_dim)
 
-        # 恢复时间维度并合并头。
+        # (batch, n_heads, seq, head_dim) -> (batch, seq, dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         # 最终投影回残差流。
@@ -265,7 +282,8 @@ class MLP(nn.Module):
         # 定义dropout层，用于防止过拟合
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, dim)。线性层只改最后一维
         # 前向传播函数
         # 首先，输入x通过第一层线性变换和SILU激活函数
         # 然后，结果乘以输入x通过第三层线性变换的结果
@@ -298,7 +316,13 @@ class DecoderLayer(nn.Module):
         # 定义前馈神经网络计算的归一化层
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin, attention_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,  # (batch, seq, dim)
+        freqs_cos: torch.Tensor,  # (seq, head_dim // 2)
+        freqs_sin: torch.Tensor,  # (seq, head_dim // 2)
+        attention_mask: Optional[torch.Tensor] = None,  # (batch, seq)，或 None
+    ) -> torch.Tensor:  # (batch, seq, dim)
         # 前向传播函数
         # 首先，输入x经过注意力归一化层，然后进行注意力计算，结果与输入x相加得到h
         # 然后，h经过前馈神经网络归一化层，然后进行前馈神经网络计算，结果与h相加得到输出
@@ -361,7 +385,11 @@ class Transformer(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _prepare_attention_mask(self, attention_mask: Optional[torch.Tensor], tokens: torch.Tensor) -> Optional[torch.Tensor]:
+    def _prepare_attention_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],  # None，或 (batch, seq) / (batch, 1, seq) / (batch, *, *, seq)
+        tokens: torch.Tensor,  # (batch, seq)
+    ) -> Optional[torch.Tensor]:  # (batch, seq)，或 None
         if attention_mask is None:
             return None
         if attention_mask.dim() == 4:
@@ -377,10 +405,10 @@ class Transformer(PreTrainedModel):
 
     def _left_pad_by_attention_mask(
             self,
-            idx: torch.Tensor,
-            attention_mask: Optional[torch.Tensor],
+            idx: torch.Tensor,  # (batch, seq) token id
+            attention_mask: Optional[torch.Tensor],  # (batch, seq)，或 None
             pad_token_id: int
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # (batch, packed_seq), 同形 mask
         if attention_mask is None or attention_mask.all():
             return idx, attention_mask
 
@@ -400,14 +428,21 @@ class Transformer(PreTrainedModel):
 
         return packed_idx, packed_mask
     
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,  # (batch, seq) token id
+        targets: Optional[torch.Tensor] = None,  # (batch, seq) token id，或 None
+        **kwargs,
+    ) -> torch.Tensor:
         """
-        - tokens: Optional[torch.Tensor], 输入 token 张量。
-        - targets: Optional[torch.Tensor], 目标 token 张量。
+        - tokens: (batch, seq) 的 token id。
+        - targets: (batch, seq) 的 token id，或 None。
         - kv_cache: bool, 是否使用键值缓存。
+        - attention_mask: 可选，(batch, seq)。
         - kwargs: 其他关键字参数。
 
-        - self.OUT: CausalLMOutputWithPast, 包含 logits 和损失。
+        - self.OUT: CausalLMOutputWithPast。
+          logits 在训练时为 (batch, seq, vocab)，推理时为 (batch, 1, vocab)。
         """
 
         if 'input_ids' in kwargs:
@@ -462,12 +497,12 @@ class Transformer(PreTrainedModel):
     @torch.inference_mode()
     def generate(
             self,
-            idx,
+            idx: torch.Tensor,  # (batch, seq) token id
             stop_id=None,
             max_new_tokens=256,
             temperature=1.0,
             top_k=None,
-            attention_mask: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,  # (batch, seq)，或 None
             pad_token_id: Optional[int] = None
     ):
         """
@@ -522,7 +557,7 @@ class Transformer(PreTrainedModel):
             if stop_id is not None and finished.all():
                 break
 
-        return idx[:, index:] # 只返回生成的token
+        return idx[:, index:]  # (batch, n_new)
     
     def _greedy_decode(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -675,14 +710,14 @@ class Transformer(PreTrainedModel):
 
     @torch.inference_mode()
     def generate_super(self,
-                       idx,
+                       idx: torch.Tensor,  # (batch, seq) token id
                        stop_id=None,
                        max_new_tokens=256,
                        temperature=1.0,
                        top_k=None,
                        do_sample=False,
                        num_beams=1,
-                       attention_mask: Optional[torch.Tensor] = None,
+                       attention_mask: Optional[torch.Tensor] = None,  # (batch, seq)，或 None
                        pad_token_id: Optional[int] = None
                        ):
         """
@@ -771,7 +806,7 @@ class Transformer(PreTrainedModel):
             if stop_id is not None and finished.all():
                 break
 
-        return idx[:, index:] # 只返回生成的token
+        return idx[:, index:]  # (batch, n_new)
 
 if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained("tokenizer_k")
