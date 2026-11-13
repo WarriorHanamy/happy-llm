@@ -1,5 +1,6 @@
 import torch
 import math
+from typing import Optional
 from torch import nn
 from dataclasses import dataclass
 from transformers import BertTokenizer
@@ -46,15 +47,20 @@ class MultiHeadAttention(nn.Module):
 
         # 创建一个上三角矩阵，用于遮蔽未来信息
         # 注意，因为是多头注意力，Mask 矩阵比之前我们定义的多一个维度
+        # mask: (1, 1, max_seq_len, max_seq_len)，广播到分数 (batch, n_heads, seq, seq)
         if is_causal:
             mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
             mask = torch.triu(mask, diagonal=1)
             # 注册为模型的缓冲区
             self.register_buffer("mask", mask)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-
-        # 获取批次大小和序列长度，[batch_size, seq_len, dim]
+    def forward(
+        self,
+        q: torch.Tensor,  # (batch, seq, n_embd)
+        k: torch.Tensor,  # (batch, seq, n_embd)，seq 必须与 q 相同
+        v: torch.Tensor,  # (batch, seq, n_embd)，seq 必须与 q 相同
+    ) -> torch.Tensor:  # (batch, seq, dim)；残差相加要求 dim == n_embd
+        # q 是三维。下面的 view 用 q 的 seq，所以 k、v 不能更长或更短。
         bsz, seqlen, _ = q.shape
 
         # 计算查询（Q）、键（K）、值（V）,输入通过参数矩阵层，维度为 (B, T, n_embed) x (n_embed, dim) -> (B, T, dim)
@@ -93,7 +99,7 @@ class MultiHeadAttention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         # 最终投影回残差流。
-        output = self.wo(output)
+        output = self.wo(output)  # (batch, seq, dim)
         output = self.resid_dropout(output)
         return output
 
@@ -106,8 +112,8 @@ class LayerNorm(nn.Module):
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
         
-    def forward(self, x):
-        # 在统计每个样本所有维度的值，求均值和方差
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)。均值和方差在最后一维，形状 (batch, seq, 1)
         mean = x.mean(-1, keepdim=True) # mean: [bsz, max_len, 1]
         std = x.std(-1, keepdim=True) # std: [bsz, max_len, 1]
         # 注意这里也在最后一个维度发生了广播
@@ -124,8 +130,8 @@ class MLP(nn.Module):
         # 定义dropout层，用于防止过拟合
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        # 前向传播函数
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, dim)。线性层只作用在最后一维
         # 首先，输入x通过第一层线性变换和RELU激活函数
         # 最后，通过第二层线性变换和dropout层
         return self.dropout(self.w2(F.relu(self.w1(x))))
@@ -141,7 +147,8 @@ class EncoderLayer(nn.Module):
         self.fnn_norm = LayerNorm(args.n_embd)
         self.feed_forward = MLP(args.dim, args.dim, args.dropout)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)，且 dim == n_embd
         # Layer Norm
         x = self.attention_norm(x)
         # 自注意力
@@ -158,7 +165,8 @@ class Encoder(nn.Module):
         self.layers = nn.ModuleList([EncoderLayer(args) for _ in range(args.n_layer)])
         self.norm = LayerNorm(args.n_embd)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)
         "分别通过 N 层 Encoder Layer"
         for layer in self.layers:
             x = layer(x)
@@ -179,7 +187,8 @@ class DecoderLayer(nn.Module):
         # 第三个部分是 MLP
         self.feed_forward = MLP(args.dim, args.dim, args.dropout)
 
-    def forward(self, x, enc_out):
+    def forward(self, x: torch.Tensor, enc_out: torch.Tensor) -> torch.Tensor:
+        # x, enc_out, 返回值: (batch, seq, n_embd)。本实现里两边的 seq 相同
         # Layer Norm
         x = self.attention_norm_1(x)
         # 掩码自注意力
@@ -199,7 +208,8 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layer)])
         self.norm = LayerNorm(args.n_embd)
 
-    def forward(self, x, enc_out):
+    def forward(self, x: torch.Tensor, enc_out: torch.Tensor) -> torch.Tensor:
+        # x, enc_out, 返回值: (batch, seq, n_embd)
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
             x = layer(x, enc_out)
@@ -223,11 +233,11 @@ class PositionalEncoding(nn.Module):
         # 分别计算 sin、cos 结果
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
+        pe = pe.unsqueeze(0)  # (block_size, n_embd) -> (1, block_size, n_embd)
         self.register_buffer("pe", pe)
 
-    def forward(self, x):
-        # 将位置编码加到 Embedding 结果上
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 与返回值: (batch, seq, n_embd)。pe 的 batch 维是 1，按 batch 广播
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
         return x
 
@@ -280,10 +290,15 @@ class Transformer(nn.Module):
 
     '''前向计算函数'''
 
-    def forward(self, idx, targets=None):
-        # 输入为 idx，维度为 (batch size, sequence length, 1)；targets 为目标序列，用于计算 loss
+    def forward(
+        self,
+        idx: torch.Tensor,  # (batch, seq) token id
+        targets: Optional[torch.Tensor] = None,  # (batch, seq) token id，推理时为 None
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # 训练: logits (batch, seq, vocab)，loss 为标量
+        # 推理: logits (batch, 1, vocab)，loss 为 None
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size()  # idx 是二维 (batch, seq)，不是 (batch, seq, 1)
         assert t <= self.args.block_size, f"不能计算该序列，该序列长度为 {t}, 最大序列长度只有 {self.args.block_size}"
 
         # 通过 self.transformer
@@ -313,7 +328,7 @@ class Transformer(nn.Module):
         else:
             # 推理阶段，我们只需要 logits，loss 为 None
             # 取 -1 是只取序列中的最后一个作为输出
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])  # (batch, 1, vocab)；list [-1] 保留 seq 维
             loss = None
 
         return logits, loss
